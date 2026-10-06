@@ -261,6 +261,97 @@ curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/js
     ]
   }'; echo
 
+say "版本槽发布：登记演示用版本链 release-demo-root -> release-demo-v1 -> release-demo-v2"
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"release-demo-root","parent_ids":[],"note":"槽发布演示根版本"}'; echo
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"release-demo-v1","parent_ids":["release-demo-root"]}'; echo
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"release-demo-v2","parent_ids":["release-demo-v1"]}'; echo
+
+say "首次统一发布：两个槽（prod 首版、canary 首版），预期修订号均为 0 -> 201，各槽修订=0"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{
+    "release_id": "example-release-1",
+    "effective_at": "2026-08-01T00:00:00Z",
+    "slots": [
+      {"slot": " prod ", "version_id": "release-demo-v1", "expected_revision": 0},
+      {"slot": "canary", "version_id": "release-demo-root", "expected_revision": 0}
+    ]
+  }'; echo
+
+say "发布重试：槽名空格差异与 +08:00 同一 UTC 瞬间均为规范化后相同内容 -> 200 replayed=true，修订不再推进"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{
+    "release_id": "example-release-1",
+    "effective_at": "2026-08-01T08:00:00+08:00",
+    "slots": [
+      {"slot": "prod", "version_id": "release-demo-v1", "expected_revision": 0},
+      {"slot": " canary ", "version_id": "release-demo-root", "expected_revision": 0}
+    ]
+  }'; echo
+
+say "发布冲突 1：同一发布标识换内容 -> 409（首次冻结结果不变）"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-1","effective_at":"2026-08-01T00:00:00Z",
+       "slots":[{"slot":"prod","version_id":"release-demo-v1","expected_revision":0}]}'; echo
+
+say "发布冲突 2：同一次发布内槽名重复（去空格后）-> 422"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-dup","effective_at":"2026-09-01T00:00:00Z",
+       "slots":[{"slot":"prod","version_id":"release-demo-v1","expected_revision":0},
+                {"slot":" prod ","version_id":"release-demo-v1","expected_revision":0}]}'; echo
+
+say "发布冲突 3：prod 第二次发布目标不是严格后代（指向自己）-> 409，整次不生效"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-bad-self","effective_at":"2026-09-01T00:00:00Z",
+       "slots":[{"slot":"prod","version_id":"release-demo-v1","expected_revision":1}]}'; echo
+
+say "发布冲突 4：预期修订号不匹配（当前修订 0，下一次应为 1，提交 5）-> 409"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-bad-rev","effective_at":"2026-09-01T00:00:00Z",
+       "slots":[{"slot":"prod","version_id":"release-demo-v2","expected_revision":5}]}'; echo
+
+say "发布冲突 5：生效时刻不晚于该槽上次发布（2026-08-01）-> 409"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-bad-time","effective_at":"2026-07-01T00:00:00Z",
+       "slots":[{"slot":"prod","version_id":"release-demo-v2","expected_revision":1}]}'; echo
+
+say "发布冲突 6：目标版本不存在 -> 404，整次拒绝且不落任何记录"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-404","effective_at":"2026-09-01T00:00:00Z",
+       "slots":[{"slot":"prod","version_id":"no-such-version","expected_revision":1}]}'; echo
+
+say "第二次合法发布：prod 推进到严格后代 release-demo-v2，修订 0 -> 1 -> 201"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-2","effective_at":"2026-09-01T00:00:00Z",
+       "slots":[{"slot":"prod","version_id":"release-demo-v2","expected_revision":1}]}'; echo
+
+say "查询：全部发布 / 按发布标识取回首次冻结记录 / 全部槽当前指针 / 单槽当前指针"
+curl -s "$BASE/releases"; echo
+curl -s "$BASE/releases/example-release-1"; echo
+curl -s "$BASE/slots"; echo
+curl -s "$BASE/slots/by-name/prod"; echo
+
+say "历史解析 1：2026-08-15（发布 1 之后、发布 2 之前）prod 当时指向 v1，修订 0"
+curl -s "$BASE/slot-resolutions/prod?at=2026-08-15T00:00:00Z"; echo
+
+say "历史解析 2：2026-09-15 prod 已推进到 v2，修订 1（+08:00 同一 UTC 瞬间等价）"
+curl -s "$BASE/slot-resolutions/prod?at=2026-09-15T08:00:00%2B08:00"; echo
+
+say "历史解析 3：恰在生效时刻即采用新发布（2026-09-01T00:00:00Z -> v2）"
+curl -s "$BASE/slot-resolutions/prod?at=2026-09-01T00:00:00Z"; echo
+
+say "历史解析错误 1：早于该槽首次发布 -> 404 slot_not_published / no_release_effective_at_or_before"
+curl -s "$BASE/slot-resolutions/prod?at=2026-01-01T00:00:00Z"; echo
+
+say "历史解析错误 2：槽从未发布 -> 404 slot_not_published / slot_never_published"
+curl -s "$BASE/slot-resolutions/no-such-slot?at=2026-09-01T00:00:00Z"; echo
+
+say "历史复现判定：解析槽当时版本后按现有规则判定用途（2026-08-15 与 2026-09-15 可能不同）"
+curl -s "$BASE/slot-permissions/prod?use=research&at=2026-08-15T00:00:00Z"; echo
+curl -s "$BASE/slot-permissions/prod?use=research&at=2026-09-15T00:00:00Z"; echo
+
 say "证明包：首次导出 example-voucher-1 -> 201（签名并原子固化）"
 curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
 

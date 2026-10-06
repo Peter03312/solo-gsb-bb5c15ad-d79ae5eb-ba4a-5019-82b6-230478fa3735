@@ -36,8 +36,15 @@ from .schemas import (
     ProofPackage,
     PublicKeyListResponse,
     PublicKeyResponse,
+    ReleasePublishRequest,
+    ReleasePublishResponse,
+    ReleaseResult,
+    ReleaseSlotResult,
     RevocationReceipt,
     RevocationResponse,
+    SlotHead,
+    SlotPermissionResponse,
+    SlotResolution,
     SubscriptionCreateRequest,
     SubscriptionCreateResponse,
     SubscriptionEventPage,
@@ -199,6 +206,152 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_version(version_id: str, request: Request) -> VersionResponse:
         return VersionResponse(**service_from(request).get_version(version_id))
+
+    # -- version-slot releases (unified publish & historical replay) ------
+
+    @app.post(
+        "/releases",
+        response_model=ReleasePublishResponse,
+        status_code=201,
+        tags=["releases"],
+        summary="按版本槽统一发布多个已登记版本（整次原子、幂等、修订不可跳过）",
+        responses={
+            200: {"description": "相同发布标识与规范化后相同内容重试，返回首次冻结结果"},
+            201: {"description": "首次发布：各槽修订推进与不可变发布记录在同一事务落库"},
+            404: {"description": "清单中存在未登记的目标版本，整次发布拒绝"},
+            409: {"description": "槽名重复/首次预期修订非 0/预期修订不匹配/目标非严格后代/生效时刻不晚于上次/发布标识复用内容不同"},
+            422: {"description": "槽位清单为空、槽名为空白或生效时刻无时区"},
+        },
+    )
+    def publish_release(
+        payload: ReleasePublishRequest, request: Request
+    ) -> JSONResponse | ReleasePublishResponse:
+        result, replayed = service_from(request).publish_release(
+            release_id=payload.release_id,
+            effective_at=payload.effective_at,
+            slots=[item.model_dump() for item in payload.slots],
+        )
+        body = ReleasePublishResponse(
+            replayed=replayed,
+            release=ReleaseResult(
+                release_id=result["release_id"],
+                effective_at=result["effective_at"],
+                created_at=result["created_at"],
+                slot_count=result["slot_count"],
+                slots=[ReleaseSlotResult(**entry) for entry in result["slots"]],
+            ),
+        )
+        if replayed:
+            # 200 OK makes an idempotent retry distinguishable from the first
+            # publish; no slot revision is advanced on a replay.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/releases",
+        response_model=list[ReleaseResult],
+        tags=["releases"],
+        summary="列出全部不可变发布记录（按首次发布时间排序）",
+    )
+    def list_releases(request: Request) -> list[ReleaseResult]:
+        return [
+            ReleaseResult(
+                release_id=result["release_id"],
+                effective_at=result["effective_at"],
+                created_at=result["created_at"],
+                slot_count=result["slot_count"],
+                slots=[ReleaseSlotResult(**entry) for entry in result["slots"]],
+            )
+            for result in service_from(request).list_releases()
+        ]
+
+    @app.get(
+        "/releases/{release_id}",
+        response_model=ReleaseResult,
+        tags=["releases"],
+        summary="按发布标识取回首次冻结的发布记录（历史不可改写）",
+        responses={404: {"description": "发布不存在"}},
+    )
+    def get_release(release_id: str, request: Request) -> ReleaseResult:
+        result = service_from(request).get_release(release_id)
+        return ReleaseResult(
+            release_id=result["release_id"],
+            effective_at=result["effective_at"],
+            created_at=result["created_at"],
+            slot_count=result["slot_count"],
+            slots=[ReleaseSlotResult(**entry) for entry in result["slots"]],
+        )
+
+    @app.get(
+        "/slots",
+        response_model=list[SlotHead],
+        tags=["releases"],
+        summary="列出全部版本槽当前最新发布（修订指针）",
+    )
+    def list_slot_heads(request: Request) -> list[SlotHead]:
+        return [SlotHead(**row) for row in service_from(request).list_slot_heads()]
+
+    @app.get(
+        "/slots/by-name/{slot}",
+        response_model=SlotHead,
+        tags=["releases"],
+        summary="按槽名查询当前最新发布；该槽从未发布返回 404",
+        responses={404: {"description": "槽位从未发布"}},
+    )
+    def get_slot_head(slot: str, request: Request) -> SlotHead:
+        return SlotHead(**service_from(request).get_slot_head(slot))
+
+    @app.get(
+        "/slot-resolutions/{slot}",
+        response_model=SlotResolution,
+        tags=["releases"],
+        summary="按槽名与带时区时刻解析当时最近的已发布目标版本",
+        responses={
+            404: {
+                "description": "槽位从未发布（slot_never_published），或该时刻之前尚无生效发布（no_release_effective_at_or_before）"
+            },
+            422: {"description": "查询时刻缺少时区或无法解析"},
+        },
+    )
+    def resolve_slot(
+        slot: str,
+        request: Request,
+        at: str = Query(..., description="带时区的历史时刻，如 2026-07-01T00:00:00Z"),
+    ) -> SlotResolution:
+        parsed = _parse_aware_param(at, "at")
+        result = service_from(request).resolve_slot(slot, parsed)
+        return SlotResolution(**result)
+
+    @app.get(
+        "/slot-permissions/{slot}",
+        response_model=SlotPermissionResponse,
+        tags=["releases"],
+        summary="按槽与带时区时刻解析历史目标版本，并用现有规则判定该时刻指定用途",
+        responses={
+            404: {"description": "槽位在该时刻尚未发布（明确报错，不猜测版本）"},
+            422: {"description": "查询时刻缺少时区或无法解析"},
+        },
+    )
+    def check_slot_permission(
+        slot: str,
+        request: Request,
+        use: str = Query(..., description="拟使用的用途（去首尾空格后判定）"),
+        at: str = Query(..., description="带时区的历史时刻，如 2026-07-01T00:00:00Z"),
+    ) -> SlotPermissionResponse:
+        parsed = _parse_aware_param(at, "at")
+        result = service_from(request).check_slot_permission(slot, use, parsed)
+        return SlotPermissionResponse(
+            slot=result["resolution"]["slot"],
+            use=result["use"],
+            at=result["at"],
+            resolution=SlotResolution(**result["resolution"]),
+            version_id=result["version_id"],
+            allowed=result["allowed"],
+            closure=result["closure"],
+            basis=[BasisEntry(**b) for b in result["basis"]],
+            blockers=[BlockerEntry(**b) for b in result["blockers"]],
+            allowed_uses_intersection=result["allowed_uses_intersection"],
+        )
 
     # -- license changes --------------------------------------------------
 

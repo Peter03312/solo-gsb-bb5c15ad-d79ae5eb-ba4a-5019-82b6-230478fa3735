@@ -101,6 +101,124 @@ class LicenseChangeBatchRequest(BaseModel):
     )
 
 
+# -- version-slot releases -------------------------------------------------
+
+
+class ReleaseSlotItem(BaseModel):
+    """一次槽位发布中的单个槽位：非空槽名、已登记目标版本、预期修订号。"""
+
+    slot: str = Field(
+        min_length=1,
+        description=(
+            "版本槽名（去首尾空格后非空且在本次发布内不可重复）。"
+            "槽名会出现在查询接口的路径参数中（/slots/by-name/{slot} 等），"
+            "建议使用字母、数字、-、_ 与点，避免包含 /"
+        ),
+    )
+    version_id: str = Field(min_length=1, description="该槽本次指向的已登记版本")
+    expected_revision: int = Field(
+        ge=0,
+        description="该槽预期修订号：首次发布必须为 0；此后必须等于该槽上次发布修订号 + 1",
+    )
+
+    @field_validator("slot")
+    @classmethod
+    def _slot(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("slot 不能为空白字符串")
+        return value
+
+
+class ReleasePublishRequest(BaseModel):
+    """一次统一发布：唯一发布标识 + 带时区生效时刻 + 非空槽位清单。"""
+
+    release_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="唯一发布标识；省略时自动生成 UUID（自动生成标识无法用于重试幂等）",
+    )
+    effective_at: datetime = Field(description="本次发布的带时区生效时刻（服务统一换算为 UTC）")
+    slots: list[ReleaseSlotItem] = Field(min_length=1, description="非空槽位清单（按请求顺序冻结）")
+
+    _check_time = field_validator("effective_at")(_ensure_aware)
+
+    @field_validator("slots")
+    @classmethod
+    def _unique_slots(cls, items: list[ReleaseSlotItem]) -> list[ReleaseSlotItem]:
+        seen: set[str] = set()
+        for item in items:
+            if item.slot in seen:
+                raise ValueError(f"槽名在同一次发布中重复：{item.slot}")
+            seen.add(item.slot)
+        return items
+
+
+class ReleaseSlotResult(BaseModel):
+    """不可变发布记录中的单个槽位结果。"""
+
+    position: int = Field(description="该槽在请求清单中的从 0 起序号")
+    slot: str
+    version_id: str
+    expected_revision: int = Field(description="客户端提交并校验通过的预期修订号")
+    revision: int = Field(description="该槽本次发布得到的修订号（首次为 0，之后严格 +1）")
+
+
+class ReleaseResult(BaseModel):
+    """发布首次结果的冻结内容（不含顶层 replayed 标记）。"""
+
+    release_id: str = Field(description="唯一发布标识")
+    effective_at: datetime = Field(description="换算为 UTC 后的生效时刻")
+    created_at: datetime = Field(description="首次发布时间（服务按 UTC 生成）")
+    slot_count: int = Field(ge=1, description="本次发布的槽位数")
+    slots: list[ReleaseSlotResult] = Field(description="按请求顺序冻结的各槽结果")
+
+
+class ReleasePublishResponse(BaseModel):
+    replayed: bool = Field(
+        description="相同发布标识与规范化后相同内容重试时为 true，返回首次冻结结果且不再推进修订"
+    )
+    release: ReleaseResult
+
+
+class SlotResolution(BaseModel):
+    """按槽名与带时区时刻解析出的当时最近已发布目标版本。"""
+
+    slot: str
+    at: datetime = Field(description="换算为 UTC 后的查询时刻")
+    version_id: str = Field(description="当时最近发布所指向的目标版本")
+    release_id: str = Field(description="该解析命中的发布标识")
+    revision: int = Field(ge=0, description="命中发布给该槽的修订号（0 起）")
+    effective_at: datetime = Field(description="命中发布的生效时刻（UTC）")
+
+
+class SlotHead(BaseModel):
+    """某槽当前最新一次发布（修订指针）。"""
+
+    slot: str
+    revision: int
+    release_id: str
+    version_id: str
+    effective_at: datetime
+    updated_at: datetime
+
+
+class SlotPermissionResponse(BaseModel):
+    """先按槽+时刻解析历史目标版本，再按现有规则判定该用途的复合结果。"""
+
+    slot: str
+    use: str
+    at: datetime
+    resolution: SlotResolution = Field(description="按槽与时刻解析出的当时目标版本")
+    version_id: str = Field(description="解析所得目标版本（与 resolution.version_id 一致）")
+    allowed: bool
+    closure: list[str] = Field(description="解析版本自身及全部祖先（去重、广度优先）")
+    basis: list[BasisEntry] = Field(default_factory=list)
+    blockers: list[BlockerEntry] = Field(default_factory=list)
+    allowed_uses_intersection: list[str] = Field(default_factory=list)
+
+
 # -- responses -------------------------------------------------------------
 
 

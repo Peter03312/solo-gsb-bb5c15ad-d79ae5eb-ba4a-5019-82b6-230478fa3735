@@ -144,6 +144,54 @@ SCHEMA_STATEMENTS = [
         PRIMARY KEY (subscription_id, seq)
     )
     """,
+    # A version-slot publish carries a unique release id, one timezone-aware
+    # effective instant and a non-empty list of slots; each slot names a
+    # trimmed non-empty slot, an existing target version and the expected
+    # revision it must replace. Rows are immutable history — no API ever
+    # updates or deletes them; the first result is frozen verbatim in
+    # result_json so an identical retry returns it without advancing anything.
+    """
+    CREATE TABLE IF NOT EXISTS releases (
+        release_id    TEXT PRIMARY KEY,
+        content_hash  TEXT NOT NULL,
+        effective_at  TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        result_json   TEXT NOT NULL
+    )
+    """,
+    # One row per slot of a release, inserted in the SAME transaction as the
+    # release row and the slot-head advances. position preserves request order
+    # (the content hash is order-sensitive); expected_revision records what the
+    # client asserted and assigned_revision the revision this publish gave the
+    # slot. Rows are immutable history.
+    """
+    CREATE TABLE IF NOT EXISTS release_slots (
+        release_id        TEXT NOT NULL REFERENCES releases(release_id),
+        position          INTEGER NOT NULL,
+        slot_name         TEXT NOT NULL,
+        version_id        TEXT NOT NULL REFERENCES versions(version_id),
+        expected_revision INTEGER NOT NULL,
+        assigned_revision INTEGER NOT NULL,
+        effective_at      TEXT NOT NULL,
+        PRIMARY KEY (release_id, position),
+        UNIQUE (slot_name, assigned_revision)
+    )
+    """,
+    # Mutable head pointer of every slot: exactly one row per trimmed slot
+    # name, advanced inside the publish transaction after every validation has
+    # passed. revision 0 is the first publish, then 1, 2, ...; the unique
+    # (slot_name, revision) history constraint on release_slots (below) makes a
+    # skipped or double-assigned revision impossible even across processes.
+    """
+    CREATE TABLE IF NOT EXISTS version_slot_heads (
+        slot_name    TEXT PRIMARY KEY,
+        revision     INTEGER NOT NULL,
+        release_id   TEXT NOT NULL REFERENCES releases(release_id),
+        version_id   TEXT NOT NULL REFERENCES versions(version_id),
+        effective_at TEXT NOT NULL,
+        updated_at   TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
@@ -154,6 +202,10 @@ SCHEMA_STATEMENTS = [
     "ON permission_subscriptions(version_id)",
     "CREATE INDEX IF NOT EXISTS idx_sub_events_subscription "
     "ON subscription_events(subscription_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_release_slots_slot "
+    "ON release_slots(slot_name, assigned_revision)",
+    "CREATE INDEX IF NOT EXISTS idx_release_slots_version "
+    "ON release_slots(version_id)",
 ]
 
 
@@ -580,3 +632,152 @@ class Database:
             "ORDER BY seq ASC LIMIT ?",
             (subscription_id, after_seq, limit),
         )
+
+    # -- version-slot releases --------------------------------------------
+
+    def get_release(self, release_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM releases WHERE release_id = ?", (release_id,)
+        )
+
+    def list_releases(self) -> list[dict[str, Any]]:
+        return self.query_all(
+            "SELECT * FROM releases ORDER BY created_at, release_id"
+        )
+
+    def insert_release(
+        self,
+        release_id: str,
+        content_hash: str,
+        effective_at: str,
+        created_at: str,
+        result_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO releases "
+            "(release_id, content_hash, effective_at, created_at, result_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (release_id, content_hash, effective_at, created_at, result_json),
+        )
+
+    def insert_release_slot(
+        self,
+        release_id: str,
+        position: int,
+        slot_name: str,
+        version_id: str,
+        expected_revision: int,
+        assigned_revision: int,
+        effective_at: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO release_slots "
+            "(release_id, position, slot_name, version_id, expected_revision, "
+            "assigned_revision, effective_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                release_id,
+                position,
+                slot_name,
+                version_id,
+                expected_revision,
+                assigned_revision,
+                effective_at,
+            ),
+        )
+
+    def get_slot_head(self, slot_name: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM version_slot_heads WHERE slot_name = ?",
+            (slot_name,),
+        )
+
+    def list_slot_heads(self) -> list[dict[str, Any]]:
+        return self.query_all(
+            "SELECT * FROM version_slot_heads ORDER BY slot_name"
+        )
+
+    def insert_slot_head(
+        self,
+        slot_name: str,
+        revision: int,
+        release_id: str,
+        version_id: str,
+        effective_at: str,
+        updated_at: str,
+    ) -> None:
+        """Advance a slot that had never been published (its revision 0 row)."""
+        self._conn.execute(
+            "INSERT INTO version_slot_heads "
+            "(slot_name, revision, release_id, version_id, effective_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (slot_name, revision, release_id, version_id, effective_at, updated_at),
+        )
+
+    def update_slot_head(
+        self,
+        slot_name: str,
+        revision: int,
+        release_id: str,
+        version_id: str,
+        effective_at: str,
+        updated_at: str,
+        previous_revision: int,
+    ) -> None:
+        """Conditionally advance a slot head only when the revision still matches.
+
+        The predicate makes the compare-and-set atomic inside the write
+        transaction: the row moves from ``previous_revision`` (the revision the
+        caller validated against) to ``revision``. ``rowcount`` is 0 when a
+        concurrent publish won the slot, which the caller maps onto a
+        revision-mismatch conflict (and rolls the whole release back).
+        """
+        cursor = self._conn.execute(
+            "UPDATE version_slot_heads SET revision = ?, release_id = ?, "
+            "version_id = ?, effective_at = ?, updated_at = ? "
+            "WHERE slot_name = ? AND revision = ?",
+            (
+                revision,
+                release_id,
+                version_id,
+                effective_at,
+                updated_at,
+                slot_name,
+                previous_revision,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError(
+                f"slot head revision advanced concurrently: {slot_name}"
+            )
+
+    def resolve_slot_at(self, slot_name: str, at: str) -> dict[str, Any] | None:
+        """Most recent publish of a slot effective at or before ``at``.
+
+        Joins the immutable release history with its entries; the effective
+        instant is the release-wide one (denormalised onto every entry) and
+        revisions are dense per slot, so the highest assigned revision at or
+        before ``at`` is exactly the historical target version.
+        """
+        return self.query_one(
+            """
+            SELECT rs.slot_name AS slot_name,
+                   rs.assigned_revision AS revision,
+                   rs.release_id AS release_id,
+                   rs.version_id AS version_id,
+                   rs.effective_at AS effective_at,
+                   r.created_at AS release_created_at
+            FROM release_slots rs
+            JOIN releases r ON r.release_id = rs.release_id
+            WHERE rs.slot_name = ? AND rs.effective_at <= ?
+            ORDER BY rs.assigned_revision DESC
+            LIMIT 1
+            """,
+            (slot_name, at),
+        )
+
+    def has_slot_any_release(self, slot_name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM release_slots WHERE slot_name = ? LIMIT 1",
+            (slot_name,),
+        ).fetchone()
+        return row is not None

@@ -107,6 +107,12 @@ class InvalidIntervalError(ServiceError):
     code = "invalid_interval"
 
 
+class SlotNotPublishedError(NotFoundError):
+    """A slot has no published version at the requested historical instant."""
+
+    code = "slot_not_published"
+
+
 # -- serialisation ---------------------------------------------------------
 
 
@@ -297,6 +303,77 @@ def _thaw_batch_result(blob: str) -> dict[str, Any]:
                 "new_event_count": int(entry["new_event_count"]),
             }
             for entry in data["changes"]
+        ],
+    }
+
+
+def release_content_hash(effective_at: str, slots: list[dict[str, Any]]) -> str:
+    """Stable hash of a release's effective instant and ordered slot list.
+
+    A retry is identical only when the normalised slots match in the SAME
+    request order with the same trimmed slot names, target versions and
+    expected revisions, and when the effective instant converts to the same
+    UTC instant.
+    """
+    payload = {
+        "effective_at": effective_at,
+        "slots": [
+            {
+                "position": entry["position"],
+                "slot": entry["slot"],
+                "version_id": entry["version_id"],
+                "expected_revision": entry["expected_revision"],
+            }
+            for entry in slots
+        ],
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _freeze_release_result(result: dict[str, Any]) -> str:
+    """Freeze a publish's first result verbatim (datetimes -> canonical UTC).
+
+    The frozen snapshot is the single source returned by every identical
+    retry, so the response stays byte-for-byte stable forever; release rows are
+    immutable history regardless of later publishes.
+    """
+    payload = {
+        "release_id": result["release_id"],
+        "effective_at": to_canonical(result["effective_at"]),
+        "created_at": to_canonical(result["created_at"]),
+        "slot_count": result["slot_count"],
+        "slots": [
+            {
+                "position": entry["position"],
+                "slot": entry["slot"],
+                "version_id": entry["version_id"],
+                "expected_revision": entry["expected_revision"],
+                "revision": entry["revision"],
+            }
+            for entry in result["slots"]
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _thaw_release_result(blob: str) -> dict[str, Any]:
+    """Inverse of :func:`_freeze_release_result` for replay/GET responses."""
+    data = json.loads(blob)
+    return {
+        "release_id": data["release_id"],
+        "effective_at": parse_canonical(data["effective_at"]),
+        "created_at": parse_canonical(data["created_at"]),
+        "slot_count": int(data["slot_count"]),
+        "slots": [
+            {
+                "position": int(entry["position"]),
+                "slot": entry["slot"],
+                "version_id": entry["version_id"],
+                "expected_revision": int(entry["expected_revision"]),
+                "revision": int(entry["revision"]),
+            }
+            for entry in data["slots"]
         ],
     }
 
@@ -1422,6 +1499,400 @@ class LicenseService:
             "next_cursor": next_cursor,
             "has_more": has_more,
         }
+
+    # -- version-slot releases (unified publish & historical replay) ------
+
+    def publish_release(
+        self,
+        release_id: str | None,
+        effective_at: datetime,
+        slots: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """Publish many registered versions as one unified slot release.
+
+        A request carries a unique ``release_id``, one timezone-aware
+        ``effective_at`` and a non-empty ordered list of slots; every entry
+        names a trimmed slot, an existing target version and the expected
+        revision it replaces. Validations:
+
+        * slot names are non-empty after trimming and unique within the release;
+        * every target version exists;
+        * a slot's first publish asserts ``expected_revision == 0``;
+        * afterwards the target must be a STRICT descendant of the slot's
+          previously published version, the effective instant must be strictly
+          later than that publish, and the expected revision must equal the
+          previous revision + 1.
+
+        Only after EVERY entry validates do the writes happen in ONE
+        transaction: the immutable release row, one immutable entry row per
+        slot and the per-slot head advance (0 -> 1 -> 2 ...). Any failure rolls
+        the whole release back — no slot skips a revision and no partial
+        release remains. A retry with the same release id and the identical
+        normalised content returns the frozen first result (``replayed=true``)
+        without advancing anything; the same id with different content is a
+        conflict. The process lock, ``BEGIN IMMEDIATE``, the conditional head
+        update and the database-level ``UNIQUE(slot_name, assigned_revision)``
+        constraint together make concurrent publishes safe across processes.
+        """
+        if not isinstance(effective_at, datetime) or effective_at.tzinfo is None:
+            raise InvalidTimeError("发布生效时刻必须带时区信息")
+        if not slots:
+            # The HTTP schema enforces this too; keep the service contract.
+            raise ServiceError("槽位清单不能为空")
+
+        release_id = release_id or f"rel-{uuid.uuid4().hex}"
+        effective = to_canonical(effective_at)
+
+        normalised: list[dict[str, Any]] = []
+        seen_slots: set[str] = set()
+        for pos, item in enumerate(slots):
+            slot = str(item["slot"]).strip()
+            if not slot:
+                raise ServiceError(f"第 {pos} 个槽位的名称不能为空", {"index": str(pos)})
+            if slot in seen_slots:
+                raise ConflictError(
+                    "槽名去首尾空格后在同一次发布中重复",
+                    {"release_id": release_id, "slot": slot, "index": str(pos)},
+                )
+            seen_slots.add(slot)
+            try:
+                expected = int(item["expected_revision"])
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(
+                    f"第 {pos} 个槽位的预期修订号必须为非负整数",
+                    {"slot": slot, "index": str(pos)},
+                ) from exc
+            if expected < 0:
+                raise ServiceError(
+                    f"第 {pos} 个槽位的预期修订号不能为负",
+                    {"slot": slot, "index": str(pos)},
+                )
+            normalised.append(
+                {
+                    "position": pos,
+                    "slot": slot,
+                    "version_id": str(item["version_id"]),
+                    "expected_revision": expected,
+                }
+            )
+
+        digest = release_content_hash(effective, normalised)
+
+        with self.db.lock:
+            existing = self.db.get_release(release_id)
+            if existing is not None:
+                if existing["content_hash"] != digest:
+                    raise ConflictError(
+                        "同一发布标识已存在但内容不同（发布标识不可复用指向不同内容）",
+                        {"release_id": release_id},
+                    )
+                return _thaw_release_result(existing["result_json"]), True
+
+            # Whole-release pre-validation before opening the write transaction.
+            missing = [
+                entry["version_id"]
+                for entry in normalised
+                if self.db.get_version(entry["version_id"]) is None
+            ]
+            if missing:
+                raise NotFoundError(
+                    "发布目标中存在尚未登记的版本，整次发布拒绝",
+                    {
+                        "release_id": release_id,
+                        "missing_version_ids": ",".join(sorted(set(missing))),
+                    },
+                )
+            plans = self._validate_slots_against_heads(normalised, effective, None)
+
+            created = to_canonical(now_utc())
+            try:
+                self.db.begin()
+                # A concurrent first-writer may have won the release id under
+                # contention; re-check inside the write transaction.
+                raced = self.db.get_release(release_id)
+                if raced is not None:
+                    if raced["content_hash"] != digest:
+                        raise ConflictError(
+                            "同一发布标识已存在但内容不同（发布标识不可复用指向不同内容）",
+                            {"release_id": release_id},
+                        )
+                    self.db.rollback()
+                    return _thaw_release_result(raced["result_json"]), True
+
+                # Re-validate against the pinned write snapshot: another process
+                # may have published any of these slots between the pre-checks
+                # and this transaction. The conditional head update plus the
+                # UNIQUE(slot, revision) constraint are the final backstops.
+                snapshot = self._capture_snapshot(manage_transaction=False)
+                plans = self._validate_slots_against_heads(
+                    normalised, effective, snapshot
+                )
+
+                slot_results: list[dict[str, Any]] = []
+                for entry, plan in zip(normalised, plans):
+                    slot_results.append(
+                        {
+                            "position": entry["position"],
+                            "slot": entry["slot"],
+                            "version_id": entry["version_id"],
+                            "expected_revision": entry["expected_revision"],
+                            "revision": plan["revision"],
+                        }
+                    )
+
+                result = {
+                    "release_id": release_id,
+                    "effective_at": parse_canonical(effective),
+                    "created_at": parse_canonical(created),
+                    "slot_count": len(slot_results),
+                    "slots": slot_results,
+                }
+                # The immutable release row is the parent of the slot entries
+                # and the new head pointers, so it is written first inside the
+                # same transaction; every remaining write either all commits
+                # with it or is rolled back.
+                self.db.insert_release(
+                    release_id=release_id,
+                    content_hash=digest,
+                    effective_at=effective,
+                    created_at=created,
+                    result_json=_freeze_release_result(result),
+                )
+                for entry, plan in zip(normalised, plans):
+                    self.db.insert_release_slot(
+                        release_id=release_id,
+                        position=entry["position"],
+                        slot_name=entry["slot"],
+                        version_id=entry["version_id"],
+                        expected_revision=entry["expected_revision"],
+                        assigned_revision=plan["revision"],
+                        effective_at=effective,
+                    )
+                    if plan["first_publish"]:
+                        self.db.insert_slot_head(
+                            slot_name=entry["slot"],
+                            revision=plan["revision"],
+                            release_id=release_id,
+                            version_id=entry["version_id"],
+                            effective_at=effective,
+                            updated_at=created,
+                        )
+                    else:
+                        self.db.update_slot_head(
+                            slot_name=entry["slot"],
+                            revision=plan["revision"],
+                            release_id=release_id,
+                            version_id=entry["version_id"],
+                            effective_at=effective,
+                            updated_at=created,
+                            previous_revision=plan["previous_revision"],
+                        )
+
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                # Concurrent writers may have won the release id or a slot
+                # revision; map each race onto replay/conflict semantics.
+                raced = self.db.get_release(release_id)
+                if raced is not None:
+                    if raced["content_hash"] == digest:
+                        return _thaw_release_result(raced["result_json"]), True
+                    raise ConflictError(
+                        "同一发布标识已存在但内容不同（发布标识不可复用指向不同内容）",
+                        {"release_id": release_id},
+                    ) from None
+                # The release itself lost no primary key: re-run the head checks
+                # so a lost slot revision surfaces as the documented 409 rather
+                # than an integrity error, and the response mentions the slot.
+                self._validate_slots_against_heads(normalised, effective, None)
+                raise
+
+            stored = self.db.get_release(release_id)
+            assert stored is not None
+            return _thaw_release_result(stored["result_json"]), False
+
+    def _validate_slots_against_heads(
+        self,
+        normalised: list[dict[str, Any]],
+        effective: str,
+        snapshot: Snapshot | None,
+    ) -> list[dict[str, Any]]:
+        """Validate revision/descendant/effective-time rules for every slot.
+
+        Runs under the caller's db lock, either before the write transaction
+        (``snapshot=None``; graph traversal hits the database) or INSIDE it with
+        the pinned write snapshot. Target-version existence is checked by the
+        caller. Returns one plan per slot (assigned revision + first-publish
+        flag) or raises on the first invalid entry; the whole release is then
+        rejected.
+        """
+        plans: list[dict[str, Any]] = []
+        for entry in normalised:
+            slot = entry["slot"]
+            target = entry["version_id"]
+            expected = entry["expected_revision"]
+            head = self.db.get_slot_head(slot)
+
+            if head is None:
+                if expected != 0:
+                    raise ConflictError(
+                        "槽位首次发布的预期修订号必须为 0",
+                        {
+                            "slot": slot,
+                            "expected_revision": str(expected),
+                            "current_revision": "0",
+                        },
+                    )
+                plans.append(
+                    {"revision": 0, "first_publish": True, "previous_revision": None}
+                )
+                continue
+
+            current = int(head["revision"])
+            wanted = current + 1
+            if expected != wanted:
+                raise ConflictError(
+                    "预期修订号与该槽当前修订不匹配（并发发布或漏发修订）",
+                    {
+                        "slot": slot,
+                        "expected_revision": str(expected),
+                        "current_revision": str(current),
+                        "required_revision": str(wanted),
+                    },
+                )
+            if effective <= head["effective_at"]:
+                raise ConflictError(
+                    "生效时刻必须严格晚于该槽上次发布的生效时刻",
+                    {
+                        "slot": slot,
+                        "submitted_effective_at": effective,
+                        "previous_effective_at": head["effective_at"],
+                    },
+                )
+            previous_version = head["version_id"]
+            if not self._is_strict_descendant(previous_version, target, snapshot):
+                raise ConflictError(
+                    "目标版本必须是该槽上次发布版本的严格后代",
+                    {
+                        "slot": slot,
+                        "previous_version_id": previous_version,
+                        "submitted_version_id": target,
+                    },
+                )
+            plans.append(
+                {
+                    "revision": wanted,
+                    "first_publish": False,
+                    "previous_revision": current,
+                }
+            )
+        return plans
+
+    def _is_strict_descendant(
+        self,
+        ancestor_id: str,
+        candidate_id: str,
+        snapshot: Snapshot | None,
+    ) -> bool:
+        """True when ``candidate_id`` is a transitive descendant (never self).
+
+        Parent edges are frozen at registration, so the version DAG only grows;
+        inside a write transaction the pinned snapshot's children map is used.
+        """
+        if candidate_id == ancestor_id:
+            return False
+        if snapshot is not None:
+            return candidate_id in set(snapshot.descendants_of(ancestor_id))
+        seen = {ancestor_id}
+        queue: deque[str] = deque([ancestor_id])
+        while queue:
+            current = queue.popleft()
+            for child in self.db.get_children(current):
+                if child == candidate_id:
+                    return True
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+        return False
+
+    def get_release(self, release_id: str) -> dict[str, Any]:
+        """Return the immutable frozen result of a release by its id."""
+        row = self.db.get_release(release_id)
+        if row is None:
+            raise NotFoundError("发布不存在", {"release_id": release_id})
+        return _thaw_release_result(row["result_json"])
+
+    def list_releases(self) -> list[dict[str, Any]]:
+        return [_thaw_release_result(row["result_json"]) for row in self.db.list_releases()]
+
+    def list_slot_heads(self) -> list[dict[str, Any]]:
+        return [self._slot_head_out(row) for row in self.db.list_slot_heads()]
+
+    def get_slot_head(self, slot: str) -> dict[str, Any]:
+        slot = slot.strip()
+        row = self.db.get_slot_head(slot) if slot else None
+        if row is None:
+            raise NotFoundError("槽位尚未发布", {"slot": slot or ""})
+        return self._slot_head_out(row)
+
+    @staticmethod
+    def _slot_head_out(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "slot": row["slot_name"],
+            "revision": int(row["revision"]),
+            "release_id": row["release_id"],
+            "version_id": row["version_id"],
+            "effective_at": parse_canonical(row["effective_at"]),
+            "updated_at": parse_canonical(row["updated_at"]),
+        }
+
+    def resolve_slot(self, slot: str, at: datetime) -> dict[str, Any]:
+        """Resolve the target version a slot published most recently at ``at``.
+
+        "Most recently" is the slot's highest revision whose release-wide
+        effective instant is at or before the timezone-aware query instant.
+        A slot that has never been published at all, or only later than the
+        query instant, is an explicit error — callers must not guess a
+        version.
+        """
+        if not isinstance(at, datetime) or at.tzinfo is None:
+            raise InvalidTimeError("查询时刻必须带时区信息")
+        slot = slot.strip()
+        if not slot:
+            raise ServiceError("槽名不能为空")
+
+        at_canonical = to_canonical(at)
+        row = self.db.resolve_slot_at(slot, at_canonical)
+        if row is not None:
+            return {
+                "slot": slot,
+                "at": at.astimezone(timezone.utc),
+                "version_id": row["version_id"],
+                "release_id": row["release_id"],
+                "revision": int(row["revision"]),
+                "effective_at": parse_canonical(row["effective_at"]),
+            }
+
+        if self.db.has_slot_any_release(slot):
+            raise SlotNotPublishedError(
+                "该槽在查询时刻之前尚无已发布版本（首次发布晚于该时刻）",
+                {"slot": slot, "at": at_canonical, "reason": "no_release_effective_at_or_before"},
+            )
+        raise SlotNotPublishedError(
+            "槽位从未发布，无法按历史时刻解析",
+            {"slot": slot, "at": at_canonical, "reason": "slot_never_published"},
+        )
+
+    def check_slot_permission(self, slot: str, use: str, at: datetime) -> dict[str, Any]:
+        """Resolve ``slot`` at ``at`` and evaluate ``use`` under current rules.
+
+        The resolution (historical target version, release id and revision) is
+        returned together with the ordinary permission decision evaluated for
+        that resolved version and the same instant.
+        """
+        resolution = self.resolve_slot(slot, at)
+        decision = self.check_permission(resolution["version_id"], use, at)
+        return {"resolution": resolution, **decision}
 
     def _propagate_subscription_flips(
         self,
