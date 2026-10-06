@@ -67,6 +67,49 @@ DEMO: list[dict[str, object]] = [
         "note": "示例：尚未登记任何许可变更的版本",
         "changes": [],
     },
+    {
+        # Grandchild on the DAG (parents both roots transitively through
+        # demo-derived-1). Used as the later target of the demo slot
+        # publications, which must move along strict descendant edges.
+        "version_id": "demo-derived-2",
+        "parent_ids": ["demo-derived-1"],
+        "note": "示例派生版本二代（版本槽发布推进目标）",
+        "changes": [
+            {
+                "change_id": "demo-chg-d2-1",
+                "effective_at": "2026-04-01T00:00:00Z",
+                "allowed_uses": ["research", "review", "commercial"],
+            }
+        ],
+    },
+]
+
+# Version-slot publications: two immutable releases published as a chain.
+# Each slot's first release claims revision 0; the second release claims the
+# slot's NEXT revision (1), targets a strict descendant and becomes effective
+# strictly later. The effective instants make historical resolution observable
+# (resolving "demo-derived" at 2026-03 vs 2026-06 returns different revisions).
+DEMO_RELEASES: list[dict[str, object]] = [
+    {
+        "release_id": "demo-rel-1",
+        "effective_at": "2026-02-15T00:00:00Z",
+        "slots": [
+            {"slot_name": "demo-slot-a", "target_version_id": "demo-root-a",
+             "expected_revision": 0},
+            {"slot_name": "demo-derived", "target_version_id": "demo-derived-1",
+             "expected_revision": 0},
+        ],
+    },
+    {
+        "release_id": "demo-rel-2",
+        "effective_at": "2026-05-01T00:00:00Z",
+        "slots": [
+            {"slot_name": "demo-slot-a", "target_version_id": "demo-derived-1",
+             "expected_revision": 1},
+            {"slot_name": "demo-derived", "target_version_id": "demo-derived-2",
+             "expected_revision": 1},
+        ],
+    },
 ]
 
 
@@ -99,5 +142,21 @@ def seed_demo_data(db: Database) -> bool:
                 ),
                 allowed_uses=list(change["allowed_uses"]),  # type: ignore[index]
             )
-    logger.info("示例数据写入完成：%d 个版本", len(DEMO))
+
+    # Version-slot publications (idempotent via the same service path).
+    for release in DEMO_RELEASES:
+        if db.get_release(str(release["release_id"])) is not None:
+            continue
+        service.publish_release(
+            release_id=str(release["release_id"]),
+            effective_at=datetime.fromisoformat(
+                str(release["effective_at"])
+            ).replace(tzinfo=timezone.utc),
+            slots=[dict(slot) for slot in release["slots"]],  # type: ignore[union-attr]
+        )
+    logger.info(
+        "示例数据写入完成：%d 个版本，%d 次版本槽发布",
+        len(DEMO),
+        len(DEMO_RELEASES),
+    )
     return True

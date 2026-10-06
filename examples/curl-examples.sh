@@ -261,6 +261,99 @@ curl -s -X POST "$BASE/license-changes/batches" -H 'Content-Type: application/js
     ]
   }'; echo
 
+say "版本槽统一发布：示例版本链 rel-demo-a -> rel-demo-b -> rel-demo-c 先登记"
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"rel-demo-a","parent_ids":[],"note":"版本槽发布调用示例"}' >/dev/null || true
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"rel-demo-b","parent_ids":["rel-demo-a"],"note":"版本槽发布调用示例"}' >/dev/null || true
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"rel-demo-c","parent_ids":["rel-demo-b"],"note":"版本槽发布调用示例"}' >/dev/null || true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"rel-demo-la","version_id":"rel-demo-a","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research"]}' >/dev/null || true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"rel-demo-lb","version_id":"rel-demo-b","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research"]}' >/dev/null || true
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"rel-demo-lc","version_id":"rel-demo-c","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research"]}' >/dev/null || true
+
+say "首次发布：两个槽（槽名首尾空格会被规范化），首发布预期修订号均为 0 -> 201，分配修订 0"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{
+    "release_id": "example-release-1",
+    "effective_at": "2026-03-01T00:00:00Z",
+    "slots": [
+      {"slot_name": " rel-a ", "target_version_id": "rel-demo-a", "expected_revision": 0},
+      {"slot_name": "rel-b", "target_version_id": "rel-demo-b", "expected_revision": 0}
+    ]
+  }'; echo
+
+say "再次发布推进各槽：预期修订号传该槽下一个修订号（当前 0 -> 声明 1），目标须为上次版本严格后代、时刻严格晚于上次 -> 分配修订 1"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{
+    "release_id": "example-release-2",
+    "effective_at": "2026-06-01T08:00:00+08:00",
+    "slots": [
+      {"slot_name": "rel-a", "target_version_id": "rel-demo-b", "expected_revision": 1},
+      {"slot_name": "rel-b", "target_version_id": "rel-demo-c", "expected_revision": 1}
+    ]
+  }'; echo
+
+say "发布重试：同发布标识 + 规范化后相同内容（槽换序、空格、+08:00 与 Z 同瞬间）-> 200 replayed=true，返回首次记录且不推进修订"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{
+    "release_id": "example-release-1",
+    "effective_at": "2026-03-01T00:00:00+00:00",
+    "slots": [
+      {"slot_name": "rel-b", "target_version_id": "rel-demo-b", "expected_revision": 0},
+      {"slot_name": "rel-a", "target_version_id": "rel-demo-a", "expected_revision": 0}
+    ]
+  }'; echo
+
+say "发布冲突 1：同发布标识不同内容（改生效时刻）-> 409，原记录与槽修订不变"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-1","effective_at":"2026-09-01T00:00:00Z","slots":[{"slot_name":"rel-a","target_version_id":"rel-demo-a","expected_revision":0}]}'; echo
+
+say "发布冲突 2：声明的修订号正确（2）但目标不是该槽上次版本（rel-demo-b）的严格后代 -> 409，整次不生效"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-bad","effective_at":"2026-09-01T00:00:00Z","slots":[{"slot_name":"rel-a","target_version_id":"rel-demo-a","expected_revision":2}]}'; echo
+
+say "发布冲突 3：目标是严格后代但生效时刻未严格晚于该槽上次发布 -> 409（先校验修订，再校验后代，最后时刻）"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-time1","effective_at":"2026-03-01T00:00:00Z","slots":[{"slot_name":"rel-time","target_version_id":"rel-demo-a","expected_revision":0}]}' >/dev/null || true
+# 声明下一个修订号 1、目标 rel-demo-b 是 a 的严格后代，但时刻与上次相同（未严格晚于）-> 409
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-time2","effective_at":"2026-03-01T00:00:00Z","slots":[{"slot_name":"rel-time","target_version_id":"rel-demo-b","expected_revision":1}]}'; echo
+
+say "发布错误：未知目标版本 -> 404（整次不生效，details.missing_version_ids）"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-404","effective_at":"2026-09-01T00:00:00Z","slots":[{"slot_name":"rel-a","target_version_id":"no-such-version","expected_revision":2}]}'; echo
+
+say "发布错误：同次槽名去空格后重复 / 空槽清单 / 无时区时刻 -> 409/422/422"
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-dup","effective_at":"2026-09-01T00:00:00Z","slots":[{"slot_name":" x ","target_version_id":"rel-demo-b","expected_revision":2},{"slot_name":"x","target_version_id":"rel-demo-c","expected_revision":2}]}'; echo
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-empty","effective_at":"2026-09-01T00:00:00Z","slots":[]}'; echo
+curl -s -X POST "$BASE/releases" -H 'Content-Type: application/json' \
+  -d '{"release_id":"example-release-naive","effective_at":"2026-09-01T00:00:00","slots":[{"slot_name":"rel-a","target_version_id":"rel-demo-b","expected_revision":2}]}'; echo
+
+say "按标识取回不可变发布记录 / 列出全部发布 / 查询槽当前状态"
+curl -s "$BASE/releases/example-release-1"; echo
+curl -s "$BASE/releases"; echo
+curl -s "$BASE/slots/rel-a"; echo
+
+say "按槽与带时区时刻解析当时最近目标：2026-04 解析到修订 0（rel-demo-a），并判定 research 允许"
+curl -s "$BASE/slots/rel-a/resolve?use=research&at=2026-04-01T00:00:00Z"; echo
+
+say "同一槽在 2026-07 解析到修订 1（rel-demo-b）；申请 commercial 则按现有规则判定拒绝"
+curl -s "$BASE/slots/rel-a/resolve?use=commercial&at=2026-07-01T00:00:00Z"; echo
+
+say "解析错误：槽从未发布 -> 404 slot_not_published；时刻早于首次发布 -> 404 not_effective_at"
+curl -s "$BASE/slots/no-such-slot/resolve?use=research&at=2026-07-01T00:00:00Z"; echo
+curl -s "$BASE/slots/rel-a/resolve?use=research&at=2025-01-01T00:00:00Z"; echo
+
+say "示例数据槽演示：demo-derived 在 2026-03 解析为 demo-derived-1@修订0，在 2026-06 解析为 demo-derived-2@修订1"
+curl -s "$BASE/slots/demo-derived/resolve?use=research&at=2026-03-01T00:00:00Z" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["resolved"])'
+curl -s "$BASE/slots/demo-derived/resolve?use=research&at=2026-06-01T00:00:00Z" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["resolved"])'
+
 say "证明包：首次导出 example-voucher-1 -> 201（签名并原子固化）"
 curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
 

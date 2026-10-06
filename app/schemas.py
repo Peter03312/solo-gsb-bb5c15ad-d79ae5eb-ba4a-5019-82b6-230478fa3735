@@ -576,3 +576,114 @@ class SubscriptionEventPage(BaseModel):
         description="下一游标（本页最后一条事件的序号；空页回显 after_seq）"
     )
     has_more: bool = Field(description="是否还有未读事件（用 next_cursor 继续翻页）")
+
+
+# -- dataset releases (version-slot publications) --------------------------
+
+
+class ReleaseSlotRequest(BaseModel):
+    """一次发布中的单个版本槽：槽名、目标版本与该槽预期修订号。"""
+
+    slot_name: str = Field(
+        min_length=1, description="版本槽名；服务去首尾空格，同次发布去空格后不可重复"
+    )
+    target_version_id: str = Field(
+        min_length=1, description="该槽本次发布指向的已登记版本（必须已存在）"
+    )
+    expected_revision: int = Field(
+        ge=0,
+        description=(
+            "该槽本次声明占据的预期修订号：首次发布必须为 0；"
+            "此后必须为该槽下一个修订号（当前修订 + 1，不能跳过）"
+        ),
+    )
+
+    @field_validator("slot_name")
+    @classmethod
+    def _slot_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("slot_name 不能为空白字符串")
+        return value
+
+    @field_validator("target_version_id")
+    @classmethod
+    def _target_version(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("target_version_id 不能为空字符串")
+        return value
+
+
+class ReleaseCreateRequest(BaseModel):
+    """一次统一发布：唯一发布标识 + 带时区生效时刻 + 非空槽清单。"""
+
+    release_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="唯一发布标识；省略时自动生成 UUID（自动生成标识无法用于重试幂等）",
+    )
+    effective_at: datetime = Field(description="发布生效时刻（必须带时区，服务统一换算 UTC）")
+    slots: list[ReleaseSlotRequest] = Field(
+        min_length=1, description="非空槽清单；槽名去首尾空格后不可重复"
+    )
+
+    _check_time = field_validator("effective_at")(_ensure_aware)
+
+
+class ReleaseSlotEntry(BaseModel):
+    """不可变发布记录中的单个槽结果（含服务分配的修订号）。"""
+
+    slot_name: str = Field(description="去首尾空格后的槽名")
+    target_version_id: str = Field(description="该槽本次发布指向的版本")
+    expected_revision: int = Field(description="请求声明的该槽预期修订号")
+    revision: int = Field(description="服务在同一事务内分配的该槽修订号（首次为 0，此后为上次+1）")
+    effective_at: datetime = Field(description="所属发布的生效时刻（UTC）")
+
+
+class ReleaseResult(BaseModel):
+    """一次发布的不可变记录（首次内容；重试恒返回同一结果）。"""
+
+    release_id: str = Field(description="唯一发布标识")
+    effective_at: datetime = Field(description="换算为 UTC 后的发布生效时刻")
+    created_at: datetime = Field(description="发布首次提交时间（服务按 UTC 生成）")
+    slots: list[ReleaseSlotEntry] = Field(
+        description="本次发布覆盖的槽（按规范化槽名升序排列）"
+    )
+
+
+class ReleaseResponse(BaseModel):
+    replayed: bool = Field(
+        description="同发布标识与规范化后相同内容重试时为 true，返回首次记录且不推进修订"
+    )
+    release: ReleaseResult
+
+
+class ReleaseResolvedRef(BaseModel):
+    """按槽+时刻解析到的当时最近发布条目引用。"""
+
+    release_id: str = Field(description="解析到的发布标识")
+    revision: int = Field(description="该槽在该发布中分配到的修订号")
+    target_version_id: str = Field(description="该槽当时指向的目标版本")
+    release_effective_at: datetime = Field(description="该发布的生效时刻（UTC）")
+
+
+class SlotResolveResponse(BaseModel):
+    slot_name: str = Field(description="被解析的槽名")
+    use: str = Field(description="去首尾空格后的待判定用途")
+    at: datetime = Field(description="换算为 UTC 后的解析/判定时刻")
+    resolved: ReleaseResolvedRef = Field(description="当时最近的槽发布条目")
+    decision: PermissionResponse = Field(
+        description="用解析所得目标版本按现有规则在该时刻对该用途的完整判定"
+    )
+
+
+class SlotStateResponse(BaseModel):
+    """某个已发布版本槽的当前状态（最近一次发布后的指针）。"""
+
+    slot_name: str
+    current_revision: int = Field(description="该槽当前修订号（首次发布后为 0，每次发布 +1）")
+    current_version_id: str = Field(description="该槽当前指向的目标版本")
+    current_release_id: str = Field(description="该槽最近一次发布的标识")
+    current_effective_at: datetime = Field(description="最近一次发布的生效时刻（UTC）")

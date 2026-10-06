@@ -144,6 +144,57 @@ SCHEMA_STATEMENTS = [
         PRIMARY KEY (subscription_id, seq)
     )
     """,
+    # A release publishes a non-empty list of version slots as one atomic,
+    # immutable unit under one unique release id: a timezone-aware effective
+    # instant plus, per slot, the target version and the client-expected
+    # revision. The first result is frozen verbatim in result_json: an
+    # identical retry (same release id and normalised effective instant/slot
+    # list) returns it without advancing anything; reusing the id with
+    # different content conflicts. Rows are immutable history — no API ever
+    # updates or deletes them.
+    """
+    CREATE TABLE IF NOT EXISTS dataset_releases (
+        release_id   TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL,
+        effective_at TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        result_json  TEXT NOT NULL
+    )
+    """,
+    # One row per slot covered by a release. revision is the slot revision
+    # assigned by that release (0 on the slot's first release, current+1 on
+    # every later one); the (slot_name, revision) unique constraint is the
+    # last line of defence ensuring concurrent publishes can never assign the
+    # same revision twice or leave a gap. effective_at is denormalised from
+    # the release header so "latest target at a given instant" is one indexed
+    # read. Rows are immutable history.
+    """
+    CREATE TABLE IF NOT EXISTS dataset_release_slots (
+        release_id        TEXT NOT NULL REFERENCES dataset_releases(release_id),
+        position          INTEGER NOT NULL,
+        slot_name         TEXT NOT NULL,
+        target_version_id TEXT NOT NULL REFERENCES versions(version_id),
+        expected_revision INTEGER NOT NULL,
+        revision          INTEGER NOT NULL,
+        effective_at      TEXT NOT NULL,
+        PRIMARY KEY (release_id, slot_name),
+        UNIQUE (slot_name, revision)
+    )
+    """,
+    # Current pointer of every published slot: the revision/target/effective
+    # instant of its latest release. The row is inserted by the slot's first
+    # release and advanced (never deleted) by every later one, always inside
+    # the SAME write transaction as the release header and slot entries, so a
+    # failed release cannot move a slot while leaving no immutable record.
+    """
+    CREATE TABLE IF NOT EXISTS dataset_slots (
+        slot_name            TEXT PRIMARY KEY,
+        current_revision     INTEGER NOT NULL,
+        current_version_id   TEXT NOT NULL REFERENCES versions(version_id),
+        current_release_id   TEXT NOT NULL REFERENCES dataset_releases(release_id),
+        current_effective_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
@@ -154,6 +205,9 @@ SCHEMA_STATEMENTS = [
     "ON permission_subscriptions(version_id)",
     "CREATE INDEX IF NOT EXISTS idx_sub_events_subscription "
     "ON subscription_events(subscription_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_release_slots_slot_time "
+    "ON dataset_release_slots(slot_name, effective_at, revision)",
+    "CREATE INDEX IF NOT EXISTS idx_slots_version ON dataset_slots(current_version_id)",
 ]
 
 
@@ -579,4 +633,153 @@ class Database:
             "WHERE subscription_id = ? AND seq > ? "
             "ORDER BY seq ASC LIMIT ?",
             (subscription_id, after_seq, limit),
+        )
+
+    # -- dataset releases (version-slot publications) ---------------------
+
+    def get_release(self, release_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM dataset_releases WHERE release_id = ?",
+            (release_id,),
+        )
+
+    def list_releases(self) -> list[dict[str, Any]]:
+        return self.query_all(
+            "SELECT * FROM dataset_releases ORDER BY effective_at, release_id"
+        )
+
+    def insert_release(
+        self,
+        release_id: str,
+        content_hash: str,
+        effective_at: str,
+        created_at: str,
+        result_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO dataset_releases "
+            "(release_id, content_hash, effective_at, created_at, result_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (release_id, content_hash, effective_at, created_at, result_json),
+        )
+
+    def insert_release_slot(
+        self,
+        release_id: str,
+        position: int,
+        slot_name: str,
+        target_version_id: str,
+        expected_revision: int,
+        revision: int,
+        effective_at: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO dataset_release_slots "
+            "(release_id, position, slot_name, target_version_id, "
+            "expected_revision, revision, effective_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                release_id,
+                position,
+                slot_name,
+                target_version_id,
+                expected_revision,
+                revision,
+                effective_at,
+            ),
+        )
+
+    def list_release_slots(self, release_id: str) -> list[dict[str, Any]]:
+        return self.query_all(
+            "SELECT * FROM dataset_release_slots WHERE release_id = ? "
+            "ORDER BY position",
+            (release_id,),
+        )
+
+    def release_slot_entry(
+        self, release_id: str, slot_name: str
+    ) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM dataset_release_slots WHERE release_id = ? AND slot_name = ?",
+            (release_id, slot_name),
+        )
+
+    def first_slot_entry(self, slot_name: str) -> dict[str, Any] | None:
+        """The slot's earliest published entry (revision 0), if it exists."""
+        return self.query_one(
+            "SELECT * FROM dataset_release_slots WHERE slot_name = ? "
+            "ORDER BY effective_at ASC, revision ASC LIMIT 1",
+            (slot_name,),
+        )
+
+    def latest_slot_entry_at(
+        self, slot_name: str, at: str
+    ) -> dict[str, Any] | None:
+        """The slot's most recent release entry effective at or before ``at``.
+
+        Resolution rule for historical reproducibility: among every published
+        entry of the slot with ``effective_at <= at`` take the latest effective
+        instant (revision breaks ties); a slot that was never published, or
+        whose first release is still in the future, returns ``None`` and the
+        caller reports an explicit "not released yet" error.
+        """
+        return self.query_one(
+            "SELECT * FROM dataset_release_slots WHERE slot_name = ? "
+            "AND effective_at <= ? ORDER BY effective_at DESC, revision DESC "
+            "LIMIT 1",
+            (slot_name, at),
+        )
+
+    def get_slot(self, slot_name: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM dataset_slots WHERE slot_name = ?",
+            (slot_name,),
+        )
+
+    def list_slots(self) -> list[dict[str, Any]]:
+        return self.query_all(
+            "SELECT * FROM dataset_slots ORDER BY slot_name"
+        )
+
+    def insert_slot(
+        self,
+        slot_name: str,
+        current_revision: int,
+        current_version_id: str,
+        current_release_id: str,
+        current_effective_at: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO dataset_slots "
+            "(slot_name, current_revision, current_version_id, "
+            "current_release_id, current_effective_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                slot_name,
+                current_revision,
+                current_version_id,
+                current_release_id,
+                current_effective_at,
+            ),
+        )
+
+    def advance_slot(
+        self,
+        slot_name: str,
+        current_revision: int,
+        current_version_id: str,
+        current_release_id: str,
+        current_effective_at: str,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE dataset_slots SET current_revision = ?, "
+            "current_version_id = ?, current_release_id = ?, "
+            "current_effective_at = ? WHERE slot_name = ?",
+            (
+                current_revision,
+                current_version_id,
+                current_release_id,
+                current_effective_at,
+                slot_name,
+            ),
         )

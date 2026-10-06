@@ -36,8 +36,13 @@ from .schemas import (
     ProofPackage,
     PublicKeyListResponse,
     PublicKeyResponse,
+    ReleaseCreateRequest,
+    ReleaseResponse,
+    ReleaseResult,
     RevocationReceipt,
     RevocationResponse,
+    SlotResolveResponse,
+    SlotStateResponse,
     SubscriptionCreateRequest,
     SubscriptionCreateResponse,
     SubscriptionEventPage,
@@ -123,7 +128,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="1.0.0",
         description=(
             "登记数据集版本与其固定父版本引用、登记按 UTC 时刻生效的允许用途变更，"
-            "并基于自身及全部祖先的最近一次有效变更的用途交集判定可否使用。"
+            "并基于自身及全部祖先的最近一次有效变更的用途交集判定可否使用；"
+            "支持按版本槽统一发布已登记版本（不可变发布记录、每槽修订链、整次原子）"
+            "并按槽与带时区时刻解析当时最近目标版本后复现用途判定。"
         ),
         lifespan=lifespan,
     )
@@ -554,6 +561,112 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_voucher_proof(voucher_id: str, request: Request) -> ProofPackage:
         return ProofPackage(**service_from(request).get_voucher_proof(voucher_id))
+
+    # -- dataset releases (version-slot publications) ---------------------
+
+    @app.post(
+        "/releases",
+        response_model=ReleaseResponse,
+        status_code=201,
+        tags=["releases"],
+        summary="按版本槽统一发布已登记数据集版本（同一事务推进修订，整次原子、幂等）",
+        responses={
+            200: {"description": "同发布标识与规范化后相同内容重试，返回首次的不可变记录"},
+            201: {"description": "发布首次提交：发布记录与各槽修订推进已同一事务完成"},
+            404: {"description": "存在未知目标版本，整次发布不生效"},
+            409: {"description": "槽名重复、预期修订号不匹配、目标非上次版本严格后代、生效时刻未严格晚于上次，或发布标识复用内容不同"},
+            422: {"description": "槽清单为空、槽名为空白或生效时刻无时区"},
+        },
+    )
+    def publish_release(
+        payload: ReleaseCreateRequest, request: Request
+    ) -> JSONResponse | ReleaseResponse:
+        release, replayed = service_from(request).publish_release(
+            release_id=payload.release_id,
+            effective_at=payload.effective_at,
+            slots=[item.model_dump() for item in payload.slots],
+        )
+        body = ReleaseResponse(replayed=replayed, release=ReleaseResult(**release))
+        if replayed:
+            # 200 distinguishes an idempotent release retry from first commit.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/releases",
+        response_model=list[ReleaseResult],
+        tags=["releases"],
+        summary="列出全部不可变发布记录（按生效时刻升序）",
+    )
+    def list_releases(request: Request) -> list[ReleaseResult]:
+        return [ReleaseResult(**row) for row in service_from(request).list_releases()]
+
+    @app.get(
+        "/releases/{release_id}",
+        response_model=ReleaseResult,
+        tags=["releases"],
+        summary="按发布标识取回首次的不可变发布记录",
+        responses={404: {"description": "发布不存在"}},
+    )
+    def get_release(release_id: str, request: Request) -> ReleaseResult:
+        return ReleaseResult(**service_from(request).get_release(release_id))
+
+    @app.get(
+        "/slots",
+        response_model=list[SlotStateResponse],
+        tags=["releases"],
+        summary="列出全部已发布版本槽及其当前指针",
+    )
+    def list_slots(request: Request) -> list[SlotStateResponse]:
+        return [
+            SlotStateResponse(**row) for row in service_from(request).list_slot_states()
+        ]
+
+    @app.get(
+        "/slots/{slot_name}",
+        response_model=SlotStateResponse,
+        tags=["releases"],
+        summary="查询某版本槽的当前状态（最近一次发布后的修订/目标版本）",
+        responses={404: {"description": "该槽从未发布"}},
+    )
+    def get_slot(slot_name: str, request: Request) -> SlotStateResponse:
+        return SlotStateResponse(**service_from(request).get_slot_state(slot_name))
+
+    @app.get(
+        "/slots/{slot_name}/resolve",
+        response_model=SlotResolveResponse,
+        tags=["releases"],
+        summary="按槽与带时区时刻解析当时最近目标版本，并按现有规则判定该时刻用途",
+        responses={
+            404: {"description": "该槽从未发布，或在指定时刻尚未发布（首次发布晚于该时刻）"},
+            422: {"description": "解析时刻缺少时区或无法解析"},
+        },
+    )
+    def resolve_slot(
+        slot_name: str,
+        request: Request,
+        use: str = Query(..., description="拟使用的用途（去首尾空格后判定）"),
+        at: str = Query(..., description="带时区的解析/判定时刻，如 2026-07-01T00:00:00Z"),
+    ) -> SlotResolveResponse:
+        parsed = _parse_aware_param(at, "at")
+        result = service_from(request).resolve_slot(slot_name, use, parsed)
+        decision = result["decision"]
+        return SlotResolveResponse(
+            slot_name=result["slot_name"],
+            use=result["use"],
+            at=result["at"],
+            resolved=result["resolved"],
+            decision=PermissionResponse(
+                version_id=decision["version_id"],
+                use=decision["use"],
+                at=decision["at"],
+                allowed=decision["allowed"],
+                closure=decision["closure"],
+                basis=[BasisEntry(**b) for b in decision["basis"]],
+                blockers=[BlockerEntry(**b) for b in decision["blockers"]],
+                allowed_uses_intersection=decision["allowed_uses_intersection"],
+            ),
+        )
 
     # -- signing keys ------------------------------------------------------
 
